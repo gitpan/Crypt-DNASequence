@@ -1,0 +1,8 @@
+Changes
+MANIFEST
+Makefile.PL
+README
+lib/Crypt/DNASequence.pm
+t/00-load.t
+t/crypt.t
+META.yml                                 Module meta-data (added by MakeMaker)
