@@ -1,8 +1,11 @@
 package Crypt::DNASequence;
 
+use IO::Compress::Gzip qw(gzip);
+use IO::Uncompress::Gunzip qw(gunzip);
+use File::Temp qw(tempfile);
 use strict;
 
-our $VERSION = '0.1';
+our $VERSION = '0.2';
 
 my $keys = [['00', '11', '01', '10'],
             ['00', '11', '10', '01'],
@@ -31,51 +34,139 @@ my $keys = [['00', '11', '01', '10'],
 
 sub encrypt {
     my $class = shift;
-    my $text = shift;
-    $text = $text;
-    
-    my $dict = initial_dict();
+    my $inputfile = shift;
+	
+	die "$inputfile is not a valid text file.\n" unless -T $inputfile;
+	
+	my ($tempfile_fh, $tempfile) = tempfile("XXXXXXXX", DIR => ".", SUFFIX => ".gz", UNLINK => 1);
+	gzip($inputfile, $tempfile)
+		or die "IO::Compress::Gzip failed: $IO::Compress::Gzip::GzipError\n";
 
-    my @letters = split "", $text;
-    my @binary_str = map { my $a = sprintf "%b", ord($_); 
-                       '0' x (8 - length($a)) . $a } @letters;
-    
-    my $str = join "", map { look_in_dict($_, $dict) } @binary_str;
-    
-    my $first_letter = substr($str, 0, 1);
-    my $number_of_a = grep {$_ eq $first_letter} split "", $str;
-    my $key_index = $number_of_a % scalar(@$keys);
+    my $dict = initial_dict();
+	
+	my $gz_fh = $tempfile_fh;
+	binmode($gz_fh);
+	
+	my $encryptedfile = "encrypted.fasta";
+	
+	open my $output_fh, ">", $encryptedfile or die $@;
+	print $output_fh "  ";
+	my $n_char = 2;
+	
+	my $first_letter;
+	my $first_run_flag = 1;
+	my $number_of_first_letter = 0;
+	# read one byte each time
+	while(read($gz_fh, my $buffer, 1)) {
+		my $a = sprintf "%b", ord($buffer);
+		my $binary_str = '0' x (8 - length($a)) . $a;
+		
+		my @nt = look_in_dict($binary_str, $dict);
+		
+		if($first_run_flag) {
+			$first_letter = $nt[0];
+			$first_run_flag = 0;
+		}
+		
+		$number_of_first_letter += grep {$_ eq $first_letter} @nt;
+		
+		for (@nt) {
+			$n_char %= 70;
+			if($n_char == 0) {
+				print $output_fh "\n";
+			}
+			
+			print $output_fh $_;
+			$n_char ++;
+		}
+	}
+
+    my $key_index = $number_of_first_letter % scalar(@$keys);
     my @key_letters = map {$dict->{$_}} @{$keys->[$key_index]};
     
-    $str = "$key_letters[0]$key_letters[1]$str$key_letters[2]$key_letters[3]";
+    for (@key_letters[2..3]) {
+		$n_char %= 70;
+		if($n_char == 0) {
+			print $output_fh "\n";
+		}
+			
+		print $output_fh $_;
+		$n_char ++;
+	}
+	
+	# move to the begining
+	seek($output_fh, 0, 0);
+	syswrite($output_fh, $key_letters[0], length($key_letters[0]));
+	syswrite($output_fh, $key_letters[1], length($key_letters[1]));
     
-    return fasta_format($str);
+    close($output_fh);
+	
+	print "Your encrypted sequence is in $encryptedfile\n";
 }
 
 sub decrypt {
     my $class = shift;
-    my $text = shift;
-    $text =~s/\s*//sg;
-
-    my $tag = substr($text, 0, 2).substr($text, -2, 2);
-    my @letters = split "", $tag;
+	my $inputfile = shift;
+	
+	die "$inputfile is not a valid file name.\n" unless -f $inputfile;
+	
+	my $inputfilesize = -s $inputfile;
+	open my $input_fh, "<", $inputfile;
+	my @key_letters;
+	read($input_fh, $key_letters[0], 1);
+	read($input_fh, $key_letters[1], 1);
+	seek($input_fh, $inputfilesize - 2, 0);
+	read($input_fh, $key_letters[2], 1);
+	read($input_fh, $key_letters[3], 1);
+	
+    my $first_letter;
+	seek($input_fh, 2, 0);
+	read($input_fh, $first_letter, 1);
+	
+	my $number_of_first_letter = 1;
+	for(my $i = 4; $i < $inputfilesize - 2; $i ++) {
+		my $buffer;
+		read($input_fh, $buffer, 1);
+		if($buffer eq $first_letter) {
+			$number_of_first_letter ++;
+		}
+	}
+	
+    my $key_index = $number_of_first_letter % scalar(@$keys);
     
-    $text = substr($text, 2, length($text) - 4);
-    my $first_letter = substr($text, 0, 1);
-    my $number_of_a = grep {$_ eq $first_letter} split "", $text;
-    my $key_index = $number_of_a % scalar(@$keys);
+    my $dict = {$key_letters[0] => $keys->[$key_index]->[0],
+                $key_letters[1] => $keys->[$key_index]->[1],
+                $key_letters[2] => $keys->[$key_index]->[2],
+                $key_letters[3] => $keys->[$key_index]->[3]};
     
-    my $dict = {$letters[0] => $keys->[$key_index]->[0],
-                $letters[1] => $keys->[$key_index]->[1],
-                $letters[2] => $keys->[$key_index]->[2],
-                $letters[3] => $keys->[$key_index]->[3]};
-    my $str = "";
-    for(my $i = 0; $i < length($text) - 1; $i += 4) {
-        my $s = substr($text, $i, 4);
-        my $bi = join "", map {$dict->{$_}} split "", $s;
-        $str .= chr(oct("0b$bi"));
-    }
-    return $str;
+	my ($tempfile_fh, $tempfile) = tempfile("XXXXXXXX", DIR => ".", SUFFIX => ".gz", UNLINK => 1);
+	
+	my $gzfile = $tempfile;
+	my $output_fh = $tempfile_fh;
+	seek($input_fh, 2, 0);
+	my $quater;
+	my $i_nt = 0;
+	for(my $i = 3; $i < $inputfilesize - 2; $i ++) {
+		my $buffer;
+		read($input_fh, $buffer, 1);
+		
+		next if($buffer eq "\n");
+		
+		$i_nt ++;
+		$quater .= $dict->{$buffer};
+		if($i_nt % 4 == 0) {
+			print $output_fh chr(oct("0b$quater"));
+			$quater = "";
+		}
+	}
+	
+	close($output_fh);
+	
+	my $decryptedfile = $gzfile;
+	$decryptedfile = "decryptedfile";
+	gunzip $gzfile, $decryptedfile;
+	
+	print "Your decrypted sequence is in $decryptedfile\n";
 }
 
 sub look_in_dict {
@@ -83,7 +174,7 @@ sub look_in_dict {
     my $dict = shift;
     
     my @di = $b =~/(\d\d)/g;
-    return join "", map {$dict->{$_}} @di;
+    return (map {$dict->{$_}} @di);
 
 }
 
@@ -115,22 +206,6 @@ sub _random_assign {
     }
 }
 
-sub fasta_format {
-    my $seq = shift;
-    
-    my $new = "";
-    
-    my $l = 0;
-    while($l + 70 <= length($seq)) {
-        $new .= substr($seq, $l, 70). "\n";
-        $l += 70;
-    }
-    if($l < length($seq)) {
-        $new .= substr($seq, $l)."\n";
-    }
-    
-    return $new;
-}
 
 __END__
 
@@ -144,12 +219,9 @@ Crypt::DNASequence - Encrypt and decrypt strings to DNA Sequences
 
   use Crypt::DNASequence;
   
-  my $text = "hello world!";
-  my $encrypted = Crypt::DNASequence->encrypt($text);
-  print $encypted."\n";
-  
-  my $decrypted = Crypt::DNASequence->decrypt($encrypted);
-  print $decrypted."\n";
+  Crypt::DNASequence->encrypt($input_filename);
+
+  Crypt::DNASequence->decrypt($encrypted_file);
 
 =head1 DESCRIPTION
 
@@ -157,22 +229,27 @@ The module is naiive and just for fun. It transforms text strings into DNA seque
 is composed of four nucleotides which are represented as A, T, C, G. If we transform 
 "abcdefghijklmnopqistuvwxyzABCDEFGHIJKLMNOPQISTUVWXYZ", the corresponding sequence would be:
 
-  GTCGACCGAGCGATCGCACGCCCGCGCGCTCGGACGGCCGGGCGGTCGTACGTCCGTGCGTTCTAACTAC
-  CGGCCTATCTCACTCCCTCGCTCTCTGACTGCCTGGCAACCAAGCAATCACACACCCACGCACTCAGACA
-  GCCAGGCAGTCATACATCCATGCATTCCAACCACCAGCCCATCCCACCCCCCCGCCCTCCGACCGCCCGG
-  AC
+  TAGACCTGTCGGTGGGTGGTTCCCCGTATGAAGGGGGGGGCTATGAGTCTACAGACTGACAGGGGGAGTC
+  AGCGAGTTAGCTAGTAAGCAAGTCCGCCCGTGCGCGCGTTCGCTCGTACGCACGTCGTCCGTTGCGCGGT
+  CGGTCTGTTAGTCAGTTCTTCCTTTGTTCGACGTACAGACGTACATACGAACAAACGCCCACCCGGCCAG
+  CCGTCCATCCGACCAACCGCGGCCGGTGCCAGGGCGGGCTGGTAGGCAGGTCTGCCTGTGTGCGGGGTGG
+  GGCCCACGCCGCACAGCAGCAGGGGGGGGGGGGGGC
 
 or
 
-  CAGCTGGCTCGCTAGCGTGCGGGCGCGCGAGCCTGCCGGCCCGCCAGCATGCAGGCACGCAAGATTGATG
-  GCCGGATAGAGTGAGGGAGCGAGAGACTGACGGACCGTTGGTTCGTTAGTGTGTGGGTGCGTGAGTCTGT
-  CGGTCCGTCAGTATGTAGGTACGTAAGGTTGGTGGTCGGGTAGGGTGGGGGGGCGGGAGGCTGGCGGGCC
-  TG
+  CGAGTTCACTAACAAACAACCTTTTACGCAGGAAAAAAAATCGCAGACTCGTGAGTCAGTGAAAAAGACT
+  GATAGACCGATCGACGGATGGACTTATTTACATATATACCTATCTACGTATGTACTACTTACCATATAAC
+  TAACTCACCGACTGACCTCCTTCCCACCTAGTACGTGAGTACGTGCGTAGGTGGGTATTTGTTTAATTGA
+  TTACTTGCTTAGTTGGTTATAATTAACATTGAAATAAATCAACGAATGAACTCATTCACACATAAAACAA
+  AATTTGTATTATGTGATGATGAAAAAAAAAAAAAAT
   
 The transformation is not unique due to a random mapping, but all the transformed sequences can be 
 decrypted correctly to the origin string.
 
 =head1 ALGORITHM
+
+First, text file are compressed into gzip files when encrypting and DNA sequences
+are first decrypted into gzip files and then uncompressed into normal text file.
 
 The algorithm behind the module is simple. Two binary bits are used to represent a nucleotide such as '00' for A, '01' for C. 
 If you have some knowledge of molecular biology, you would know that A only matches to T and C only matches to G.
@@ -205,13 +282,13 @@ CTGA. 5. Translate the DNA sequence according the dictionary into binary bit for
 
 =over 4
 
-=item C<Crypt::DNASequence->encrypt($string)>
+=item C<Crypt::DNASequence-E<gt>encrypt($input_file)>
 
-encrypt the string to DNA sequence
+encrypt the text file to DNA sequence
 
-=item C<Crypt::DNASequence->decrypt($encrypted)>
+=item C<Crypt::DNASequence-E<gt>decrypt($encrypted_file)>
 
-decrypt the DNA sequence to the origin string
+decrypt the DNA sequence to the origin text file.
                
 =back
 
